@@ -11,105 +11,109 @@ app.use(express.json());
 app.use(cors());
 
 const downloadsDir = path.join(__dirname, 'downloads');
-const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Your cookies file path
+const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your cookies file path here
 
+// Ensure the downloads directory exists and is accessible
 (async () => {
-  if (!await fs.access(downloadsDir).then(() => true).catch(() => false)) {
+  try {
     await fs.mkdir(downloadsDir, { recursive: true });
     await fs.chmod(downloadsDir, '777');
+  } catch (error) {
+    console.error('Error setting up downloads directory:', error);
   }
 })();
 
 app.get('/', (req, res) => {
-  res.send('Combine-Two API for YouTube URLs is running!');
+  res.send('API for combining two YouTube videos is running!');
 });
 
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
-
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
 
-  console.log(`Parsed start: ${start}, end: ${end}`);
-
   if (!mainUrl || !backgroundUrl || isNaN(start) || isNaN(end) || start >= end) {
-    return res.status(400).json({ error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.' });
+    return res.status(400).json({
+      error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.'
+    });
   }
 
   const timestamp = Date.now();
-  // The duration is already used by yt-dlp to download a trimmed segment,
-  // so we don't need to trim again in FFmpeg.
-  const mainSegmentPath = path.join(downloadsDir, `mainSegment-${timestamp}.mp4`);
-  const backgroundSegmentPath = path.join(downloadsDir, `backgroundSegment-${timestamp}.mp4`);
-  const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
+  const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
+  const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
+  const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   try {
-    // Download main segment (video + audio)
+    // Download the main video segment (video + audio)
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
-    console.log(`Executing main download: ${mainCmd}`);
+    console.log("Downloading main segment:", mainCmd);
     await new Promise((resolve, reject) => {
-      exec(mainCmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error(`Main download stderr: ${stderr}`);
-          return reject(new Error(`Main download failed: ${err.message}, stderr: ${stderr}`));
+      exec(mainCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("Error downloading main segment:", stderr);
+          return reject(new Error("Failed to download main segment."));
         }
-        console.log(`Main download stdout: ${stdout}`);
         resolve();
       });
     });
 
-    // Download background segment (video only)
+    // Download the background video segment (video only)
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
-    console.log(`Executing background download: ${bgCmd}`);
+    console.log("Downloading background segment:", bgCmd);
     await new Promise((resolve, reject) => {
-      exec(bgCmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error(`Background download stderr: ${stderr}`);
-          return reject(new Error(`Background download failed: ${err.message}, stderr: ${stderr}`));
+      exec(bgCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("Error downloading background segment:", stderr);
+          return reject(new Error("Failed to download background segment."));
         }
-        console.log(`Background download stdout: ${stdout}`);
         resolve();
       });
     });
 
     // Combine the two videos using FFmpeg.
-    // Since yt-dlp already downloads trimmed segments,
-    // we removed the trim filters and simply scale, pad, and stack the videos.
-    // The preset is changed to 'veryfast' to reduce CPU usage.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];[v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -r 30 -threads 1 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputFilePath}"`;
-    console.log(`Executing FFmpeg: ${ffmpegCmd}`);
+    // Each video is scaled and padded to 1080x960 so that stacking vertically creates a 1080x1920 output.
+    // The audio is taken from the main video only.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v0]; [1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error(`FFmpeg stderr: ${stderr}`);
-          return reject(new Error(`FFmpeg failed: ${err.message}, stderr: ${stderr}`));
+      exec(ffmpegCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("Error combining videos:", stderr);
+          return reject(new Error("FFmpeg failed to combine videos."));
         }
-        console.log(`FFmpeg stdout: ${stdout}`);
         resolve();
       });
     });
 
-    // Send the resulting file and clean up temporary files
-    res.sendFile(outputFilePath, async (err) => {
+    // Send the resulting file and clean up temporary files after sending
+    res.sendFile(outputPath, async (err) => {
       if (err) {
-        console.error(`Send error: ${err.message}`);
-        return res.status(500).json({ error: err.message });
+        console.error("Error sending file:", err);
+        return res.status(500).json({ error: "Failed to send output file." });
       }
+      try {
+        await Promise.all([
+          fs.unlink(mainSegmentPath),
+          fs.unlink(backgroundSegmentPath),
+          fs.unlink(outputPath)
+        ]);
+        console.log("Cleaned up temporary files.");
+      } catch (cleanupError) {
+        console.error("Error cleaning up temporary files:", cleanupError);
+      }
+    });
+  } catch (error) {
+    console.error("Processing error:", error);
+    res.status(500).json({ error: error.message });
+    try {
       await Promise.all([
         fs.unlink(mainSegmentPath).catch(() => {}),
         fs.unlink(backgroundSegmentPath).catch(() => {}),
-        fs.unlink(outputFilePath).catch(() => {}),
+        fs.unlink(outputPath).catch(() => {})
       ]);
-      console.log('File sent and cleaned up.');
-    });
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    res.status(500).json({ error: error.message });
-    await Promise.all([
-      fs.unlink(mainSegmentPath).catch(() => {}),
-      fs.unlink(backgroundSegmentPath).catch(() => {}),
-      fs.unlink(outputFilePath).catch(() => {}),
-    ]);
+    } catch (cleanupError) {
+      console.error("Error cleaning up after failure:", cleanupError);
+    }
   }
 });
 
