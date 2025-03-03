@@ -3,7 +3,6 @@ const { exec } = require('child_process');
 const path = require('path');
 const cors = require('cors');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');  // For generating unique job IDs
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,18 +10,19 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-// Directory for storing downloaded/combined files
+// Create a "downloads" folder if it doesn't exist
 const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir);
 }
 
-// In-memory job store (for demo purposes; use a DB in production)
-const jobs = {};
+app.get('/', (req, res) => {
+  res.send('Combine-Two API is running!');
+});
 
 /**
- * POST /submit-job
- * Expects JSON body:
+ * POST /combine-two
+ * Expects a JSON body:
  * {
  *   "mainUrl": "https://www.youtube.com/watch?v=MAIN_VIDEO_ID",
  *   "backgroundUrl": "https://www.youtube.com/watch?v=BACKGROUND_VIDEO_ID",
@@ -30,112 +30,73 @@ const jobs = {};
  *   "endSeconds": 300
  * }
  *
- * Immediately returns a job ID, and processes the job asynchronously.
+ * Workflow:
+ * 1. Download the segment from the main URL (video+audio) using yt-dlp.
+ * 2. Download the segment from the background URL (video only) using yt-dlp.
+ * 3. Use ffmpeg to trim (via -ss and -to), scale (to 1920x540), and stack the two videos vertically.
+ *    Audio is mapped from the main video.
+ * 4. Return the combined video file.
  */
-app.post('/submit-job', (req, res) => {
+app.post('/combine-two', (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   if (!mainUrl || !backgroundUrl || startSeconds === undefined || endSeconds === undefined) {
-    return res.status(400).json({ error: 'Missing required fields: mainUrl, backgroundUrl, startSeconds, endSeconds.' });
+    return res.status(400).json({ error: 'Missing required fields: mainUrl, backgroundUrl, startSeconds, and endSeconds.' });
   }
 
-  const jobId = uuidv4();
-  jobs[jobId] = { status: 'queued', outputFile: null, error: null };
-  res.json({ jobId });
-
-  // Process the job asynchronously:
-  processJob(jobId, mainUrl, backgroundUrl, startSeconds, endSeconds);
-});
-
-/**
- * GET /job-status/:jobId
- * Returns the status of a job.
- */
-app.get('/job-status/:jobId', (req, res) => {
-  const { jobId } = req.params;
-  if (!jobs[jobId]) {
-    return res.status(404).json({ error: 'Job not found.' });
-  }
-  res.json(jobs[jobId]);
-});
-
-/**
- * Function to process the video job asynchronously.
- */
-function processJob(jobId, mainUrl, backgroundUrl, startSeconds, endSeconds) {
-  // Update job status
-  jobs[jobId].status = 'processing';
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `mainSegment-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `backgroundSegment-${timestamp}.mp4`);
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
-  // Download main segment (video+audio)
-  const mainCommand = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
-  console.log(`Job ${jobId}: Executing mainCommand: ${mainCommand}`);
-  exec(mainCommand, (errorMain, stdoutMain, stderrMain) => {
-    if (errorMain) {
-      console.error(`Job ${jobId}: Error executing mainCommand: ${errorMain.message}`);
-      jobs[jobId].status = 'failed';
-      jobs[jobId].error = errorMain.message;
-      return;
+  // Download segment from mainUrl (video+audio)
+  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+  console.log(`Downloading main segment: ${mainCmd}`);
+  exec(mainCmd, (errMain, stdoutMain, stderrMain) => {
+    if (errMain) {
+      console.error(`Error downloading main segment: ${errMain.message}`);
+      return res.status(500).json({ error: errMain.message });
     }
-    console.log(`Job ${jobId}: Main segment downloaded.`);
+    console.log(`Main segment downloaded: ${stdoutMain}`);
 
-    // Download background segment (video only)
-    const backgroundCommand = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f bestvideo --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
-    console.log(`Job ${jobId}: Executing backgroundCommand: ${backgroundCommand}`);
-    exec(backgroundCommand, (errorBg, stdoutBg, stderrBg) => {
-      if (errorBg) {
-        console.error(`Job ${jobId}: Error executing backgroundCommand: ${errorBg.message}`);
-        jobs[jobId].status = 'failed';
-        jobs[jobId].error = errorBg.message;
-        return;
+    // Download segment from backgroundUrl (video only)
+    const bgCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f bestvideo --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    console.log(`Downloading background segment: ${bgCmd}`);
+    exec(bgCmd, (errBg, stdoutBg, stderrBg) => {
+      if (errBg) {
+        console.error(`Error downloading background segment: ${errBg.message}`);
+        return res.status(500).json({ error: errBg.message });
       }
-      console.log(`Job ${jobId}: Background segment downloaded.`);
+      console.log(`Background segment downloaded: ${stdoutBg}`);
 
-      // Combine segments using ffmpeg:
-      const ffmpegCommand = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540[v0]; [1:v]scale=1920:540[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
-      console.log(`Job ${jobId}: Executing ffmpegCommand: ${ffmpegCommand}`);
-      exec(ffmpegCommand, (errorFfmpeg, stdoutFfmpeg, stderrFfmpeg) => {
-        // Clean up the temporary segment files
+      // Combine segments with ffmpeg:
+      // - Scale each video to 1920x540.
+      // - Stack them vertically (vstack), mapping audio from the main video.
+      const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540[v0]; [1:v]scale=1920:540[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
+      console.log(`Combining segments: ${ffmpegCmd}`);
+      exec(ffmpegCmd, (errFfmpeg, stdoutFfmpeg, stderrFfmpeg) => {
+        // Cleanup temporary files
         fs.unlink(mainSegmentPath, () => {});
         fs.unlink(backgroundSegmentPath, () => {});
 
-        if (errorFfmpeg) {
-          console.error(`Job ${jobId}: Error executing ffmpegCommand: ${errorFfmpeg.message}`);
-          jobs[jobId].status = 'failed';
-          jobs[jobId].error = errorFfmpeg.message;
-          return;
+        if (errFfmpeg) {
+          console.error(`Error combining segments: ${errFfmpeg.message}`);
+          return res.status(500).json({ error: errFfmpeg.message });
         }
-        console.log(`Job ${jobId}: ffmpeg processing complete.`);
-        jobs[jobId].status = 'completed';
-        jobs[jobId].outputFile = outputFilePath;
+        console.log(`Segments combined: ${stdoutFfmpeg}`);
+
+        // Send the combined file in the response
+        res.sendFile(outputFilePath, (errSend) => {
+          if (errSend) {
+            console.error(`Error sending combined file: ${errSend.message}`);
+            return res.status(500).json({ error: errSend.message });
+          }
+          console.log('Combined video file sent successfully.');
+        });
       });
     });
-  });
-}
-
-/**
- * GET /download-job/:jobId
- * Once a job is completed, this endpoint returns the combined video file.
- */
-app.get('/download-job/:jobId', (req, res) => {
-  const { jobId } = req.params;
-  const job = jobs[jobId];
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found.' });
-  }
-  if (job.status !== 'completed') {
-    return res.status(400).json({ error: 'Job not completed yet.' });
-  }
-  res.sendFile(job.outputFile, (err) => {
-    if (err) {
-      console.error(`Error sending file for job ${jobId}:`, err);
-      res.status(500).json({ error: 'Error sending combined video file.' });
-    }
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`Job Processing API is running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
