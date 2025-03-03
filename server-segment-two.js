@@ -62,7 +62,7 @@ app.post('/combine-two', (req, res) => {
     console.log(`Main segment downloaded: ${stdoutMain}`);
 
     // Download background segment with video only (no audio)
-    const bgCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo[acodec=none]" --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    const bgCmd = `yt-dlp --no-check-certificate --download-sections "*${startSeconds}-${endSeconds}" -f "best" --merge-output-format mp4 -o "output.mp4" "video_url"`;
     console.log(`Downloading background segment: ${bgCmd}`);
     exec(bgCmd, (errBg, stdoutBg, stderrBg) => {
       if (errBg) {
