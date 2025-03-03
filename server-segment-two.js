@@ -52,7 +52,7 @@ app.post('/combine-two', (req, res) => {
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   // Revised command for main segment with an explicit format string
-  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
   console.log(`Downloading main segment: ${mainCmd}`);
   exec(mainCmd, (errMain, stdoutMain, stderrMain) => {
     if (errMain) {
