@@ -43,7 +43,7 @@ app.post('/combine-two', async (req, res) => {
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   try {
-    // Download main segment (video + audio, like /download)
+    // Download main segment (video + audio)
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log(`Executing main download: ${mainCmd}`);
     await new Promise((resolve, reject) => {
@@ -57,7 +57,7 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Download background segment (video only, like /download-video-only)
+    // Download background segment (video only)
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log(`Executing background download: ${bgCmd}`);
     await new Promise((resolve, reject) => {
@@ -71,8 +71,10 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Combine with FFmpeg
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration}[v0];[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration}[v1];[v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -r 30 -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputFilePath}"`;
+    // Combine the two videos using FFmpeg
+    // The command scales and pads each video to 1080x960, applies a trim with setpts to reset timestamps,
+    // and then stacks them vertically to form a 1080x1920 output.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration},setpts=PTS-STARTPTS[v0];[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration},setpts=PTS-STARTPTS[v1];[v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -r 30 -threads 1 -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputFilePath}"`;
     console.log(`Executing FFmpeg: ${ffmpegCmd}`);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (err, stdout, stderr) => {
@@ -85,7 +87,7 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Send file
+    // Send the resulting file and clean up temporary files
     res.sendFile(outputFilePath, async (err) => {
       if (err) {
         console.error(`Send error: ${err.message}`);
