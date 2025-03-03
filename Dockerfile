@@ -4,7 +4,7 @@ FROM node:18
 # Update package lists and install Python3, pip, and ffmpeg
 RUN apt-get update && apt-get install -y python3-pip ffmpeg
 
-# Install yt-dlp using pip3 with system override flag (if needed elsewhere)
+# Install yt-dlp using pip3 with the flag to override system constraints
 RUN pip3 install --break-system-packages yt-dlp
 
 # Set the working directory inside the container
@@ -22,5 +22,5 @@ COPY . .
 # Expose the port your app runs on
 EXPOSE 3000
 
-# Start the server
-CMD ["node", "server.js"]
+# Start the server using our new file
+CMD ["node", "server-segment-two.js"]
