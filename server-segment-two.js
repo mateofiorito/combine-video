@@ -10,39 +10,26 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-// Increase request timeout to 5 minutes
-app.use((req, res, next) => {
-  req.setTimeout(300000); // 5 minutes
-  next();
-});
-
 // Create a "downloads" folder if it doesn’t exist
 const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir, { recursive: true });
-  fs.chmodSync(downloadsDir, '777'); // Ensure write permissions (adjust for production)
+  fs.chmodSync(downloadsDir, '777'); // Adjust permissions as needed
 }
 
 app.get('/', (req, res) => {
   res.send('Combine-Two API for YouTube URLs is running!');
 });
 
-/**
- * POST /combine-two
- * Expects a JSON body:
- * {
- *   "mainUrl": "https://www.youtube.com/watch?v=MAIN_VIDEO_ID",
- *   "backgroundUrl": "https://www.youtube.com/watch?v=BACKGROUND_VIDEO_ID",
- *   "startSeconds": 32,
- *   "endSeconds": 45
- * }
- *
- * Downloads, processes, and combines two video segments, then cleans up files.
- */
 app.post('/combine-two', (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
+
+  // Validate input
   if (!mainUrl || !backgroundUrl || startSeconds === undefined || endSeconds === undefined) {
     return res.status(400).json({ error: 'Missing required fields: mainUrl, backgroundUrl, startSeconds, and endSeconds.' });
+  }
+  if (startSeconds >= endSeconds) {
+    return res.status(400).json({ error: 'startSeconds must be less than endSeconds' });
   }
 
   const timestamp = Date.now();
@@ -52,7 +39,7 @@ app.post('/combine-two', (req, res) => {
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   // Download main segment with video and audio
-  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+  const mainCmd = `yt-dlp --no-check-certificate --download-sections "*${startSeconds}-${endSeconds}" -f "best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
   console.log(`Downloading main segment: ${mainCmd}`);
   exec(mainCmd, (errMain, stdoutMain, stderrMain) => {
     if (errMain) {
@@ -62,7 +49,7 @@ app.post('/combine-two', (req, res) => {
     console.log(`Main segment downloaded: ${stdoutMain}`);
 
     // Download background segment with video only (no audio)
-    const bgCmd = `yt-dlp --no-check-certificate --download-sections "*${startSeconds}-${endSeconds}" -f "best" --merge-output-format mp4 -o "output.mp4" "video_url"`;
+    const bgCmd = `yt-dlp --no-check-certificate --download-sections "*${startSeconds}-${endSeconds}" -f "bestvideo[acodec=none]" --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log(`Downloading background segment: ${bgCmd}`);
     exec(bgCmd, (errBg, stdoutBg, stderrBg) => {
       if (errBg) {
@@ -71,11 +58,11 @@ app.post('/combine-two', (req, res) => {
       }
       console.log(`Background segment downloaded: ${stdoutBg}`);
 
-      // Combine segments with FFmpeg, ensuring same duration
+      // Combine segments with FFmpeg, stacking vertically
       const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540,trim=duration=${duration}[v0]; [1:v]scale=1920:540,trim=duration=${duration}[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
       console.log(`Combining segments: ${ffmpegCmd}`);
       exec(ffmpegCmd, (errFmpeg, stdoutFfmpeg, stderrFfmpeg) => {
-        // Clean up temporary segment files
+        // Clean up temporary files
         fs.unlink(mainSegmentPath, () => {});
         fs.unlink(backgroundSegmentPath, () => {});
 
@@ -92,7 +79,6 @@ app.post('/combine-two', (req, res) => {
             return res.status(500).json({ error: errSend.message });
           }
           console.log('Combined video file sent successfully.');
-          // Clean up the output file after sending
           fs.unlink(outputFilePath, () => {});
         });
       });
