@@ -11,7 +11,7 @@ app.use(express.json());
 app.use(cors());
 
 const downloadsDir = path.join(__dirname, 'downloads');
-const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Add your cookies file path
+const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Your cookies file path
 
 (async () => {
   if (!await fs.access(downloadsDir).then(() => true).catch(() => false)) {
@@ -37,7 +37,8 @@ app.post('/combine-two', async (req, res) => {
   }
 
   const timestamp = Date.now();
-  const duration = end - start;
+  // The duration is already used by yt-dlp to download a trimmed segment,
+  // so we don't need to trim again in FFmpeg.
   const mainSegmentPath = path.join(downloadsDir, `mainSegment-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `backgroundSegment-${timestamp}.mp4`);
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
@@ -71,10 +72,11 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Combine the two videos using FFmpeg
-    // The command scales and pads each video to 1080x960, applies a trim with setpts to reset timestamps,
-    // and then stacks them vertically to form a 1080x1920 output.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration},setpts=PTS-STARTPTS[v0];[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1,trim=duration=${duration},setpts=PTS-STARTPTS[v1];[v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -r 30 -threads 1 -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputFilePath}"`;
+    // Combine the two videos using FFmpeg.
+    // Since yt-dlp already downloads trimmed segments,
+    // we removed the trim filters and simply scale, pad, and stack the videos.
+    // The preset is changed to 'veryfast' to reduce CPU usage.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];[1:v]scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];[v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a -r 30 -threads 1 -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputFilePath}"`;
     console.log(`Executing FFmpeg: ${ffmpegCmd}`);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (err, stdout, stderr) => {
