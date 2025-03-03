@@ -71,10 +71,13 @@ app.post('/combine-two', async (req, res) => {
     });
 
     // Combine the two videos using FFmpeg.
-    // Both inputs are forced to 30 fps before scaling and padding.
-    // Each is scaled to fit within 1080x960 and padded to exactly 1080x960.
-    // They are then stacked vertically (resulting in 1080x1920) and the output is forced to yuv420p.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=decrease,pad=1080:960:(ow-iw)/2:(oh-ih)/2,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // For each input:
+    //  - Force 30 fps.
+    //  - Scale with 'force_original_aspect_ratio=increase' to ensure it fills the desired area.
+    //  - Crop to exactly 1080x960.
+    //  - Set SAR to 1.
+    // Then stack them vertically to form a 1080x1920 output.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
