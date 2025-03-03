@@ -104,7 +104,7 @@ app.post('/combine-two', (req, res) => {
               console.log('Combined video file sent successfully.');
             }
           });
-        }, 3000);
+        }, 30000);
       });
     });
   });
