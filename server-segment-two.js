@@ -31,9 +31,9 @@ app.get('/', (req, res) => {
  * }
  *
  * This endpoint:
- * 1. Downloads a segment from the main URL (video+audio) using yt-dlp with --download-sections.
- * 2. Downloads a segment from the background URL (video only) similarly.
- * 3. Uses ffmpeg to scale both segments to 1920x540 and stack them vertically (main on top, background on bottom) in a 1920x1080 frame.
+ * 1. Downloads a segment from the main URL (video+audio) using yt-dlp with a format string that forces video.
+ * 2. Downloads a segment from the background URL (video only).
+ * 3. Uses ffmpeg to scale both segments to 1920x540 and stack them vertically (main on top, background on bottom) so the output is 1920x1080.
  * 4. Maps audio from the main segment.
  * 5. Returns the combined video file.
  */
@@ -45,12 +45,14 @@ app.post('/combine-two', (req, res) => {
 
   const timestamp = Date.now();
   const timeRange = `*${startSeconds}-${endSeconds}`;
+  // Use a revised format string for the main segment:
+  // Try to get the best video stream (with ext=mp4) and best audio (with ext=m4a) and merge them.
   const mainSegmentPath = path.join(downloadsDir, `mainSegment-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `backgroundSegment-${timestamp}.mp4`);
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
-  // Command to download the main segment (video+audio) using --download-sections to specify the time range
-  const mainCmd = `yt-dlp --no-check-certificate --download-sections "${timeRange}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+  // Revised command for main segment with an explicit format string
+  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
   console.log(`Downloading main segment: ${mainCmd}`);
   exec(mainCmd, (errMain, stdoutMain, stderrMain) => {
     if (errMain) {
@@ -59,8 +61,8 @@ app.post('/combine-two', (req, res) => {
     }
     console.log(`Main segment downloaded: ${stdoutMain}`);
 
-    // Command to download the background segment (video only)
-    const bgCmd = `yt-dlp --no-check-certificate --download-sections "${timeRange}" -f bestvideo --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    // Command for background segment remains the same
+    const bgCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f bestvideo --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log(`Downloading background segment: ${bgCmd}`);
     exec(bgCmd, (errBg, stdoutBg, stderrBg) => {
       if (errBg) {
@@ -70,12 +72,12 @@ app.post('/combine-two', (req, res) => {
       console.log(`Background segment downloaded: ${stdoutBg}`);
 
       // Combine segments with ffmpeg:
-      // Scale each video to 1920x540, then stack them vertically.
-      // Map audio from the main segment (input 0) if available.
+      // Scale each video to 1920x540, then stack vertically.
+      // Map audio from the main segment.
       const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540[v0]; [1:v]scale=1920:540[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
       console.log(`Combining segments: ${ffmpegCmd}`);
       exec(ffmpegCmd, (errFfmpeg, stdoutFfmpeg, stderrFfmpeg) => {
-        // Clean up temporary segment files
+        // Clean up temporary files
         fs.unlink(mainSegmentPath, () => {});
         fs.unlink(backgroundSegmentPath, () => {});
 
@@ -84,8 +86,6 @@ app.post('/combine-two', (req, res) => {
           return res.status(500).json({ error: errFfmpeg.message });
         }
         console.log(`Segments combined: ${stdoutFfmpeg}`);
-
-        // Send the combined file
         res.sendFile(outputFilePath, (errSend) => {
           if (errSend) {
             console.error(`Error sending combined file: ${errSend.message}`);
