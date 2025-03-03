@@ -23,4 +23,4 @@ COPY . .
 EXPOSE 3000
 
 # Start the server using our new file
-CMD ["node", "server-segment-two.js"]
+CMD ["node", "server.js"]
