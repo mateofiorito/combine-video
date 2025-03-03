@@ -10,10 +10,17 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-// Create a "downloads" folder if it doesn't exist
+// Increase request timeout to 5 minutes
+app.use((req, res, next) => {
+  req.setTimeout(300000); // 5 minutes
+  next();
+});
+
+// Create a "downloads" folder if it doesn’t exist
 const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
-  fs.mkdirSync(downloadsDir);
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  fs.chmodSync(downloadsDir, '777'); // Ensure write permissions (adjust for production)
 }
 
 app.get('/', (req, res) => {
@@ -30,12 +37,7 @@ app.get('/', (req, res) => {
  *   "endSeconds": 45
  * }
  *
- * This endpoint:
- * 1. Downloads a segment from the main URL (video+audio) using yt-dlp with a format string that forces video.
- * 2. Downloads a segment from the background URL (video only).
- * 3. Uses ffmpeg to scale both segments to 1920x540 and stack them vertically (main on top, background on bottom) so the output is 1920x1080.
- * 4. Maps audio from the main segment.
- * 5. Returns the combined video file.
+ * Downloads, processes, and combines two video segments, then cleans up files.
  */
 app.post('/combine-two', (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -44,15 +46,13 @@ app.post('/combine-two', (req, res) => {
   }
 
   const timestamp = Date.now();
-  const timeRange = `*${startSeconds}-${endSeconds}`;
-  // Use a revised format string for the main segment:
-  // Try to get the best video stream (with ext=mp4) and best audio (with ext=m4a) and merge them.
+  const duration = endSeconds - startSeconds;
   const mainSegmentPath = path.join(downloadsDir, `mainSegment-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `backgroundSegment-${timestamp}.mp4`);
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
-  // Revised command for main segment with an explicit format string
-  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+  // Download main segment with video and audio
+  const mainCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
   console.log(`Downloading main segment: ${mainCmd}`);
   exec(mainCmd, (errMain, stdoutMain, stderrMain) => {
     if (errMain) {
@@ -61,8 +61,8 @@ app.post('/combine-two', (req, res) => {
     }
     console.log(`Main segment downloaded: ${stdoutMain}`);
 
-    // Command for background segment remains the same
-    const bgCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f bestvideo --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    // Download background segment with video only (no audio)
+    const bgCmd = `yt-dlp --no-check-certificate -ss ${startSeconds} -to ${endSeconds} -f "bestvideo[acodec=none]" --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log(`Downloading background segment: ${bgCmd}`);
     exec(bgCmd, (errBg, stdoutBg, stderrBg) => {
       if (errBg) {
@@ -71,28 +71,29 @@ app.post('/combine-two', (req, res) => {
       }
       console.log(`Background segment downloaded: ${stdoutBg}`);
 
-      // Combine segments with ffmpeg:
-      // Scale each video to 1920x540, then stack vertically.
-      // Map audio from the main segment.
-      const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540[v0]; [1:v]scale=1920:540[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
+      // Combine segments with FFmpeg, ensuring same duration
+      const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]scale=1920:540,trim=duration=${duration}[v0]; [1:v]scale=1920:540,trim=duration=${duration}[v1]; [v0][v1]vstack=inputs=2[v]" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 "${outputFilePath}"`;
       console.log(`Combining segments: ${ffmpegCmd}`);
-      exec(ffmpegCmd, (errFfmpeg, stdoutFfmpeg, stderrFfmpeg) => {
-        // Clean up temporary files
+      exec(ffmpegCmd, (errFmpeg, stdoutFfmpeg, stderrFfmpeg) => {
+        // Clean up temporary segment files
         fs.unlink(mainSegmentPath, () => {});
         fs.unlink(backgroundSegmentPath, () => {});
 
-        if (errFfmpeg) {
-          console.error(`Error combining segments: ${errFfmpeg.message}`);
-          return res.status(500).json({ error: errFfmpeg.message });
+        if (errFmpeg) {
+          console.error(`Error combining segments: ${errFmpeg.message}`);
+          return res.status(500).json({ error: errFmpeg.message });
         }
         console.log(`Segments combined: ${stdoutFfmpeg}`);
+
+        // Send the combined file and clean up afterward
         res.sendFile(outputFilePath, (errSend) => {
           if (errSend) {
             console.error(`Error sending combined file: ${errSend.message}`);
             return res.status(500).json({ error: errSend.message });
-          } else {
-            console.log('Combined video file sent successfully.');
           }
+          console.log('Combined video file sent successfully.');
+          // Clean up the output file after sending
+          fs.unlink(outputFilePath, () => {});
         });
       });
     });
