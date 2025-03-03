@@ -38,6 +38,8 @@ app.get('/', (req, res) => {
  * 4. Return the combined video file.
  */
 app.post('/combine-two', (req, res) => {
+  const requestId = Date.now();
+  console.log(`Request ${requestId} received`);
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   if (!mainUrl || !backgroundUrl || startSeconds === undefined || endSeconds === undefined) {
     return res.status(400).json({ error: 'Missing required fields: mainUrl, backgroundUrl, startSeconds, and endSeconds.' });
