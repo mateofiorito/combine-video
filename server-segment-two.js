@@ -11,6 +11,8 @@ app.use(express.json());
 app.use(cors());
 
 const downloadsDir = path.join(__dirname, 'downloads');
+const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Add your cookies file path
+
 (async () => {
   if (!await fs.access(downloadsDir).then(() => true).catch(() => false)) {
     await fs.mkdir(downloadsDir, { recursive: true });
@@ -41,31 +43,31 @@ app.post('/combine-two', async (req, res) => {
   const outputFilePath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   try {
-    // Download main segment with detailed error logging
-    const mainCmd = `yt-dlp --no-check-certificate --download-sections "*${start}-${end}" -f "bestvideo[height<=1920]+bestaudio" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
+    // Download main segment (video + audio, like /download)
+    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log(`Executing main download: ${mainCmd}`);
-    const mainResult = await new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       exec(mainCmd, (err, stdout, stderr) => {
         if (err) {
           console.error(`Main download stderr: ${stderr}`);
           return reject(new Error(`Main download failed: ${err.message}, stderr: ${stderr}`));
         }
         console.log(`Main download stdout: ${stdout}`);
-        resolve(stdout);
+        resolve();
       });
     });
 
-    // Download background segment
-    const bgCmd = `yt-dlp --no-check-certificate --download-sections "*${start}-${end}" -f "bestvideo[height<=1920][acodec=none]" --merge-output-format mp4 -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    // Download background segment (video only, like /download-video-only)
+    const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log(`Executing background download: ${bgCmd}`);
-    const bgResult = await new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       exec(bgCmd, (err, stdout, stderr) => {
         if (err) {
           console.error(`Background download stderr: ${stderr}`);
           return reject(new Error(`Background download failed: ${err.message}, stderr: ${stderr}`));
         }
         console.log(`Background download stdout: ${stdout}`);
-        resolve(stdout);
+        resolve();
       });
     });
 
