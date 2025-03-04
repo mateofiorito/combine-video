@@ -31,20 +31,23 @@ app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
-
+  
   if (!mainUrl || !backgroundUrl || isNaN(start) || isNaN(end) || start >= end) {
     return res.status(400).json({
       error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.'
     });
   }
-
+  
+  // Calculate the duration of the main video segment.
+  const duration = end - start;
+  
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
   const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   try {
-    // Download the main segment (video + audio)
+    // Download the main segment (video + audio) using the provided start and end seconds.
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log("Downloading main segment:", mainCmd);
     await new Promise((resolve, reject) => {
@@ -56,9 +59,9 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-
-    // Download the background segment (video only)
-    const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
+    
+    // Download the background segment (video only) from second 0 until the duration of the main video.
+    const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
     await new Promise((resolve, reject) => {
       exec(bgCmd, (error, stdout, stderr) => {
@@ -69,14 +72,14 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-
+    
     // Combine the two videos using FFmpeg.
     // For each input:
     //  - Force 30 fps.
-    //  - Scale with 'force_original_aspect_ratio=increase' to ensure it fills the desired area.
+    //  - Scale with force_original_aspect_ratio=increase so the video fills at least 1080x960.
     //  - Crop to exactly 1080x960.
     //  - Set SAR to 1.
-    // Then stack them vertically to form a 1080x1920 output.
+    // Then stack them vertically to create a 1080x1920 output.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
@@ -88,7 +91,7 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-
+    
     // Send the resulting file and clean up temporary files
     res.sendFile(outputPath, async (err) => {
       if (err) {
@@ -106,7 +109,7 @@ app.post('/combine-two', async (req, res) => {
         console.error("Cleanup error:", cleanupError);
       }
     });
-
+    
   } catch (error) {
     console.error("Processing error:", error);
     res.status(500).json({ error: error.message });
