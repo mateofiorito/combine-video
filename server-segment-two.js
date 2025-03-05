@@ -134,8 +134,8 @@ app.post('/combine-two', async (req, res) => {
 /**
  * Endpoint: /extract-audio
  * - Downloads the main video segment (from startSeconds to endSeconds) as an audio-only file.
- * - Uses FFmpeg to extract, trim, and resample the audio to an MP3 file.
- * - This helps correct any timestamp mismatches so that the audio aligns with the video.
+ * - Uses FFmpeg with input seeking and timestamp resetting to extract the audio as an MP3 file.
+ * - This method attempts to remove any extra offset or delay by using -ss, -t, and -avoid_negative_ts.
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -169,12 +169,10 @@ app.post('/extract-audio', async (req, res) => {
       });
     });
 
-    // Extract audio, trim it to the exact duration, and resample to correct timing.
-    // The atrim filter ensures the output is exactly 'duration' seconds.
-    // asetpts resets the presentation timestamps.
-    // aresample=async=1 helps adjust the audio stream to avoid small timestamp mismatches.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter:a "atrim=start=0:duration=${duration},asetpts=PTS-STARTPTS,aresample=async=1" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
-    console.log("Extracting and trimming audio with FFmpeg:", ffmpegCmd);
+    // Instead of using atrim, use FFmpeg's input options to seek and trim exactly.
+    // The command uses -ss and -t on the input and resets negative timestamps with -avoid_negative_ts make_zero.
+    const ffmpegCmd = `ffmpeg -y -ss 0 -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
+    console.log("Extracting audio with FFmpeg using input seeking:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
         if (error) {
