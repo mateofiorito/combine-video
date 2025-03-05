@@ -10,18 +10,17 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json());
 app.use(cors());
 
-// Serve the 'videos' folder as static content.
+// Serve the videos folder as static (if needed)
 app.use('/videos', express.static(path.join(__dirname, 'videos')));
 
 const downloadsDir = path.join(__dirname, 'downloads');
 const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your cookies file path
 
-// Ensure the downloads directory exists
+// Ensure the downloads directory and videos folder exist
 (async () => {
   try {
     await fs.mkdir(downloadsDir, { recursive: true });
     await fs.chmod(downloadsDir, '777');
-    // Also create a videos folder for public access.
     await fs.mkdir(path.join(__dirname, 'videos'), { recursive: true });
   } catch (err) {
     console.error('Error creating directories:', err);
@@ -34,10 +33,12 @@ app.get('/', (req, res) => {
 
 /**
  * Endpoint: /combine-two
- * - Downloads the main and background segments.
- * - Processes them to produce a 1080x1920 combined video.
- * - Copies the output file to a public "videos" folder.
- * - Returns a JSON response with the public URL for the combined video.
+ * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
+ * - For the main video, it zooms in using an extra factor and then crops to 1080x960.
+ * - The background video is processed similarly.
+ * - Finally, both videos are stacked vertically to produce a 1080x1920 output.
+ * - The output video is re-encoded using H.264 baseline with faststart enabled.
+ * - The public URL is then returned.
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -55,12 +56,13 @@ app.post('/combine-two', async (req, res) => {
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
   const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
-  // Destination in the public folder
+  // Also copy to public folder for external access
   const publicPath = path.join(__dirname, 'videos', `combined-${timestamp}.mp4`);
-  // Construct the public URL (adjust the domain as needed)
+  // Construct public URL (adjust your domain as needed)
   const publicUrl = `https://yourdomain.com/videos/combined-${timestamp}.mp4`;
 
   try {
+    // Download main segment (video + audio)
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log("Downloading main segment:", mainCmd);
     await new Promise((resolve, reject) => {
@@ -73,6 +75,7 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
+    // Download background segment (video only)
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
     await new Promise((resolve, reject) => {
@@ -85,12 +88,15 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Process and combine the videos using FFmpeg.
-    // (Adjust filter parameters as needed.)
+    // Combine the videos using FFmpeg.
+    // Main video: zoom in extra (using a zoom factor of 1.1 on the height) then center-crop to 1080x960.
+    // Background video: scale and center-crop to 1080x960.
+    // Then stack both videos vertically.
+    // Re-encode with H.264 baseline and faststart.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
 [0:v]fps=30,scale=iw*max(1080/iw\\,(960*1.1)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
 [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
-[v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+[v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -profile:v baseline -preset veryfast -crf 23 -movflags +faststart -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
@@ -102,18 +108,18 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Copy the output file to the public folder.
+    // Copy the combined file to the public folder
     await fs.copyFile(outputPath, publicPath);
     console.log("Copied combined video to public folder:", publicPath);
 
-    // Clean up temporary files.
+    // Clean up temporary files
     await Promise.all([
       fs.unlink(mainSegmentPath),
       fs.unlink(backgroundSegmentPath),
       fs.unlink(outputPath)
     ]);
 
-    // Return the public URL.
+    // Return the public URL in JSON format
     res.json({ combined_video_url: publicUrl });
 
   } catch (error) {
