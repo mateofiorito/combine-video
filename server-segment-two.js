@@ -30,7 +30,8 @@ app.get('/', (req, res) => {
 /**
  * Endpoint: /combine-two
  * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - Processes both videos by scaling, cropping, and stacking them vertically into a 1080x1920 output.
+ * - Processes both videos by forcing them to cover a 1080x960 area via scaling with "force_original_aspect_ratio=increase" and center cropping.
+ * - The processed videos are then stacked vertically to produce a 1080x1920 output.
  * - The audio is taken from the main video.
  */
 app.post('/combine-two', async (req, res) => {
@@ -79,14 +80,13 @@ app.post('/combine-two', async (req, res) => {
     });
 
     // Combine the two videos using FFmpeg.
-    // Each video is processed:
-    //  - Forced to 30 fps.
-    //  - Scaled with force_original_aspect_ratio=increase so it fills at least 1080x960.
-    //  - Cropped to exactly 1080x960.
-    //  - SAR set to 1.
-    // Then the videos are stacked vertically (vstack) to produce a 1080x1920 output.
-    // The audio from the main video is mapped.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // For each input:
+    //  - Force 30 fps.
+    //  - Scale with force_original_aspect_ratio=increase to ensure the video covers at least 1080x960.
+    //  - Center crop explicitly with crop=1080:960:(in_w-1080)/2:(in_h-960)/2.
+    //  - Set SAR to 1.
+    // Then stack them vertically (vstack) to produce a 1080x1920 output.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
@@ -134,8 +134,8 @@ app.post('/combine-two', async (req, res) => {
 /**
  * Endpoint: /extract-audio
  * - Downloads the main video segment (from startSeconds to endSeconds) as an audio-only file.
- * - Uses FFmpeg to extract and convert the audio to an MP3 file.
- * - Applies an explicit trim using the atrim filter so that the audio duration exactly matches the desired segment.
+ * - Uses FFmpeg to extract, trim, and resample the audio to an MP3 file.
+ * - This helps correct any timestamp mismatches so that the audio aligns with the video.
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -169,9 +169,11 @@ app.post('/extract-audio', async (req, res) => {
       });
     });
 
-    // Extract audio and trim it to the exact duration using FFmpeg.
-    // The atrim filter is used to ensure the output duration is exactly 'duration' seconds.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter:a "atrim=start=0:duration=${duration},asetpts=PTS-STARTPTS" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
+    // Extract audio, trim it to the exact duration, and resample to correct timing.
+    // The atrim filter ensures the output is exactly 'duration' seconds.
+    // asetpts resets the presentation timestamps.
+    // aresample=async=1 helps adjust the audio stream to avoid small timestamp mismatches.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter:a "atrim=start=0:duration=${duration},asetpts=PTS-STARTPTS,aresample=async=1" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
     console.log("Extracting and trimming audio with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
