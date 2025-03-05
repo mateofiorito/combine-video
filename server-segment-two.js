@@ -27,20 +27,25 @@ app.get('/', (req, res) => {
   res.send('API for combining two YouTube videos is running!');
 });
 
+/**
+ * Endpoint: /combine-two
+ * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
+ * - Processes both videos by scaling, cropping, and stacking them vertically into a 1080x1920 output.
+ * - The audio is taken from the main video.
+ */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
-  
+
   if (!mainUrl || !backgroundUrl || isNaN(start) || isNaN(end) || start >= end) {
     return res.status(400).json({
       error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.'
     });
   }
-  
-  // Calculate the duration of the main video segment.
+
+  // Calculate the duration for the main video segment.
   const duration = end - start;
-  
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
@@ -59,7 +64,7 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-    
+
     // Download the background segment (video only) from second 0 until the duration of the main video.
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
@@ -72,14 +77,15 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-    
+
     // Combine the two videos using FFmpeg.
-    // For each input:
-    //  - Force 30 fps.
-    //  - Scale with force_original_aspect_ratio=increase so the video fills at least 1080x960.
-    //  - Crop to exactly 1080x960.
-    //  - Set SAR to 1.
-    // Then stack them vertically to create a 1080x1920 output.
+    // Each video is processed:
+    //  - Forced to 30 fps.
+    //  - Scaled with force_original_aspect_ratio=increase so it fills at least 1080x960.
+    //  - Cropped to exactly 1080x960.
+    //  - SAR set to 1.
+    // Then the videos are stacked vertically (vstack) to produce a 1080x1920 output.
+    // The audio from the main video is mapped.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
@@ -91,7 +97,7 @@ app.post('/combine-two', async (req, res) => {
         resolve();
       });
     });
-    
+
     // Send the resulting file and clean up temporary files
     res.sendFile(outputPath, async (err) => {
       if (err) {
@@ -109,7 +115,7 @@ app.post('/combine-two', async (req, res) => {
         console.error("Cleanup error:", cleanupError);
       }
     });
-    
+
   } catch (error) {
     console.error("Processing error:", error);
     res.status(500).json({ error: error.message });
@@ -125,6 +131,86 @@ app.post('/combine-two', async (req, res) => {
   }
 });
 
+/**
+ * Endpoint: /extract-audio
+ * - Downloads the main video segment from startSeconds to endSeconds using yt-dlp (audio-only).
+ * - Uses FFmpeg to extract and convert the audio to an MP3 file.
+ */
+app.post('/extract-audio', async (req, res) => {
+  const { mainUrl, startSeconds, endSeconds } = req.body;
+  const start = parseFloat(startSeconds);
+  const end = parseFloat(endSeconds);
+
+  if (!mainUrl || isNaN(start) || isNaN(end) || start >= end) {
+    return res.status(400).json({
+      error: 'Invalid or missing fields: mainUrl, startSeconds, endSeconds.'
+    });
+  }
+
+  const timestamp = Date.now();
+  const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
+  const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
+
+  try {
+    // Download only the audio from the main video segment.
+    // We use the bestaudio format to get an audio-only file.
+    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`;
+    console.log("Downloading audio segment:", mainCmd);
+    await new Promise((resolve, reject) => {
+      exec(mainCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("Error downloading audio segment:", stderr);
+          return reject(new Error("Failed to download audio segment."));
+        }
+        resolve();
+      });
+    });
+
+    // Extract audio and convert to MP3 using FFmpeg.
+    // The '-vn' flag disables video, and libmp3lame is used for MP3 encoding.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
+    console.log("Extracting audio with FFmpeg:", ffmpegCmd);
+    await new Promise((resolve, reject) => {
+      exec(ffmpegCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("FFmpeg audio extraction error:", stderr);
+          return reject(new Error("FFmpeg failed to extract audio."));
+        }
+        resolve();
+      });
+    });
+
+    // Send the resulting MP3 file and clean up temporary files
+    res.sendFile(audioOutputPath, async (err) => {
+      if (err) {
+        console.error("Error sending file:", err);
+        return res.status(500).json({ error: "Failed to send audio file." });
+      }
+      try {
+        await Promise.all([
+          fs.unlink(mainSegmentPath),
+          fs.unlink(audioOutputPath)
+        ]);
+        console.log("Cleaned up temporary audio files.");
+      } catch (cleanupError) {
+        console.error("Cleanup error:", cleanupError);
+      }
+    });
+  } catch (error) {
+    console.error("Processing audio error:", error);
+    res.status(500).json({ error: error.message });
+    try {
+      await Promise.all([
+        fs.unlink(mainSegmentPath).catch(() => {}),
+        fs.unlink(audioOutputPath).catch(() => {})
+      ]);
+    } catch (cleanupError) {
+      console.error("Cleanup error after failure:", cleanupError);
+    }
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
