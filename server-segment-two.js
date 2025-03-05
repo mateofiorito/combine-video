@@ -29,10 +29,7 @@ app.get('/', (req, res) => {
 
 /**
  * Endpoint: /combine-two
- * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - Processes both videos by forcing them to cover a 1080x960 area via scaling with "force_original_aspect_ratio=increase" and center cropping.
- * - The processed videos are then stacked vertically to produce a 1080x1920 output.
- * - The audio is taken from the main video.
+ * (Unchanged from previous versions.)
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -45,7 +42,6 @@ app.post('/combine-two', async (req, res) => {
     });
   }
 
-  // Calculate the duration for the main video segment.
   const duration = end - start;
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
@@ -53,7 +49,6 @@ app.post('/combine-two', async (req, res) => {
   const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
 
   try {
-    // Download the main segment (video + audio) using the provided start and end seconds.
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log("Downloading main segment:", mainCmd);
     await new Promise((resolve, reject) => {
@@ -66,7 +61,6 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Download the background segment (video only) from second 0 until the duration of the main video.
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
     await new Promise((resolve, reject) => {
@@ -79,13 +73,6 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Combine the two videos using FFmpeg.
-    // For each input:
-    //  - Force 30 fps.
-    //  - Scale with force_original_aspect_ratio=increase to ensure the video covers at least 1080x960.
-    //  - Center crop explicitly with crop=1080:960:(in_w-1080)/2:(in_h-960)/2.
-    //  - Set SAR to 1.
-    // Then stack them vertically (vstack) to produce a 1080x1920 output.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
@@ -98,7 +85,6 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Send the resulting file and clean up temporary files
     res.sendFile(outputPath, async (err) => {
       if (err) {
         console.error("Error sending file:", err);
@@ -115,7 +101,6 @@ app.post('/combine-two', async (req, res) => {
         console.error("Cleanup error:", cleanupError);
       }
     });
-
   } catch (error) {
     console.error("Processing error:", error);
     res.status(500).json({ error: error.message });
@@ -133,9 +118,9 @@ app.post('/combine-two', async (req, res) => {
 
 /**
  * Endpoint: /extract-audio
- * - Downloads the main video segment (from startSeconds to endSeconds) as an audio-only file.
- * - Uses FFmpeg with input seeking and timestamp resetting to extract the audio as an MP3 file.
- * - This method attempts to remove any extra offset or delay by using -ss, -t, and -avoid_negative_ts.
+ * - Downloads the entire audio from the main video (using bestaudio).
+ * - Uses FFmpeg to seek to startSeconds and then extract exactly (endSeconds - startSeconds) seconds of audio.
+ * - This approach avoids relying on yt-dlp's section download for audio.
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -148,30 +133,30 @@ app.post('/extract-audio', async (req, res) => {
     });
   }
 
-  // Calculate the duration for the audio segment.
   const duration = end - start;
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
 
   try {
-    // Download only the audio from the main video segment.
-    // We use the bestaudio format to get an audio-only file.
-    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`;
-    console.log("Downloading audio segment:", mainCmd);
+    // Download the entire audio stream (without sectioning)
+    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`;
+    console.log("Downloading audio stream:", mainCmd);
     await new Promise((resolve, reject) => {
       exec(mainCmd, (error, stdout, stderr) => {
         if (error) {
-          console.error("Error downloading audio segment:", stderr);
-          return reject(new Error("Failed to download audio segment."));
+          console.error("Error downloading audio stream:", stderr);
+          return reject(new Error("Failed to download audio stream."));
         }
         resolve();
       });
     });
 
-    // Instead of using atrim, use FFmpeg's input options to seek and trim exactly.
-    // The command uses -ss and -t on the input and resets negative timestamps with -avoid_negative_ts make_zero.
-    const ffmpegCmd = `ffmpeg -y -ss 0 -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
+    // Use FFmpeg input seeking to extract exactly the desired segment.
+    // -ss is specified before the input so that seeking is done during demuxing.
+    // -t specifies the duration to extract.
+    // -avoid_negative_ts make_zero resets any negative timestamps.
+    const ffmpegCmd = `ffmpeg -y -ss ${start} -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
     console.log("Extracting audio with FFmpeg using input seeking:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
@@ -183,7 +168,6 @@ app.post('/extract-audio', async (req, res) => {
       });
     });
 
-    // Send the resulting MP3 file and clean up temporary files
     res.sendFile(audioOutputPath, async (err) => {
       if (err) {
         console.error("Error sending file:", err);
