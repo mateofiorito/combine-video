@@ -10,6 +10,9 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json());
 app.use(cors());
 
+// Serve the 'videos' folder as static content.
+app.use('/videos', express.static(path.join(__dirname, 'videos')));
+
 const downloadsDir = path.join(__dirname, 'downloads');
 const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your cookies file path
 
@@ -18,8 +21,10 @@ const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your coo
   try {
     await fs.mkdir(downloadsDir, { recursive: true });
     await fs.chmod(downloadsDir, '777');
+    // Also create a videos folder for public access.
+    await fs.mkdir(path.join(__dirname, 'videos'), { recursive: true });
   } catch (err) {
-    console.error('Error creating downloads directory:', err);
+    console.error('Error creating directories:', err);
   }
 })();
 
@@ -29,12 +34,10 @@ app.get('/', (req, res) => {
 
 /**
  * Endpoint: /combine-two
- * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - For the main video, we force an extra zoom by scaling with:
- *       scale=iw*max(1080/iw, (960*1.1)/ih):ih*max(1080/iw, (960*1.1)/ih)
- *   which ensures that its height exceeds 960 (by 10%) and then we crop the center to 1080x960.
- * - The background video is processed as before (center-cropped).
- * - Finally, the two processed videos are stacked vertically (producing a 1080x1920 output) with audio from the main video.
+ * - Downloads the main and background segments.
+ * - Processes them to produce a 1080x1920 combined video.
+ * - Copies the output file to a public "videos" folder.
+ * - Returns a JSON response with the public URL for the combined video.
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -52,9 +55,12 @@ app.post('/combine-two', async (req, res) => {
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
   const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
+  // Destination in the public folder
+  const publicPath = path.join(__dirname, 'videos', `combined-${timestamp}.mp4`);
+  // Construct the public URL (adjust the domain as needed)
+  const publicUrl = `https://yourdomain.com/videos/combined-${timestamp}.mp4`;
 
   try {
-    // Download the main segment (video + audio) using the provided start and end seconds.
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log("Downloading main segment:", mainCmd);
     await new Promise((resolve, reject) => {
@@ -67,7 +73,6 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Download the background segment (video only) from second 0 until the duration of the main video.
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
     await new Promise((resolve, reject) => {
@@ -80,12 +85,8 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Process and combine videos using FFmpeg.
-    // For the main video:
-    //   - fps=30 for a consistent frame rate.
-    //   - scale with extra zoom: we force the height to be at least 960*1.1 so it zooms in.
-    //   - crop=1080:960 crops the center to exactly 1080x960.
-    // For the background video, we use a centered crop as before.
+    // Process and combine the videos using FFmpeg.
+    // (Adjust filter parameters as needed.)
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
 [0:v]fps=30,scale=iw*max(1080/iw\\,(960*1.1)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
 [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
@@ -101,23 +102,19 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Send the resulting file and clean up temporary files.
-    res.sendFile(outputPath, async (err) => {
-      if (err) {
-        console.error("Error sending file:", err);
-        return res.status(500).json({ error: "Failed to send output file." });
-      }
-      try {
-        await Promise.all([
-          fs.unlink(mainSegmentPath),
-          fs.unlink(backgroundSegmentPath),
-          fs.unlink(outputPath)
-        ]);
-        console.log("Cleaned up temporary files.");
-      } catch (cleanupError) {
-        console.error("Cleanup error:", cleanupError);
-      }
-    });
+    // Copy the output file to the public folder.
+    await fs.copyFile(outputPath, publicPath);
+    console.log("Copied combined video to public folder:", publicPath);
+
+    // Clean up temporary files.
+    await Promise.all([
+      fs.unlink(mainSegmentPath),
+      fs.unlink(backgroundSegmentPath),
+      fs.unlink(outputPath)
+    ]);
+
+    // Return the public URL.
+    res.json({ combined_video_url: publicUrl });
 
   } catch (error) {
     console.error("Processing error:", error);
@@ -136,7 +133,7 @@ app.post('/combine-two', async (req, res) => {
 
 /**
  * Endpoint: /extract-audio
- * - (Remains unchanged from the previous working version.)
+ * (Remains unchanged from the previous working version.)
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -155,7 +152,6 @@ app.post('/extract-audio', async (req, res) => {
   const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
 
   try {
-    // Download the entire audio stream (without sectioning) using bestaudio.
     const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`;
     console.log("Downloading audio stream:", mainCmd);
     await new Promise((resolve, reject) => {
@@ -168,7 +164,6 @@ app.post('/extract-audio', async (req, res) => {
       });
     });
 
-    // Use FFmpeg input seeking to extract exactly the desired segment.
     const ffmpegCmd = `ffmpeg -y -ss ${start} -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
     console.log("Extracting audio with FFmpeg using input seeking:", ffmpegCmd);
     await new Promise((resolve, reject) => {
