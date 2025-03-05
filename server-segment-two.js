@@ -92,7 +92,7 @@ app.post('/combine-two', async (req, res) => {
     // Main video: Zoom with extra factor, then center-crop to 1080x960.
     // Background video: Process similarly (center-cropped).
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
-[0:v]fps=30,scale=iw*max(1080/iw\\,(960*1.1)/ih):ih*max(1080/iw\\,(960*1.1)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
+[0:v]fps=30,scale=iw*max(1080/iw\\,(960*1.1)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
 [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
 [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -profile:v baseline -preset veryfast -crf 23 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
