@@ -30,10 +30,10 @@ app.get('/', (req, res) => {
 /**
  * Endpoint: /combine-two
  * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - For the main video, it scales preserving the original width (by setting the height to 960) then center-crops horizontally to 1080.
- *   This avoids stretching the image horizontally (some left/right parts may be lost).
- * - The background video is processed as before.
- * - Finally, the two processed videos are stacked vertically (producing a 1080x1920 output) with audio from the main video.
+ * - For the main video, we zoom in (using scale=1080:960:force_original_aspect_ratio=increase) so that its height fills 960 pixels,
+ *   then center-crop to exactly 1080 width. This avoids black spaces at the top and bottom.
+ * - The background video is processed to fill 1080×960 via scaling and centered cropping.
+ * - Finally, the two processed videos are stacked vertically (resulting in 1080×1920 output) with audio from the main video.
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -79,16 +79,15 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Process both videos with FFmpeg.
+    // Process and combine the videos using FFmpeg.
     // For the main video:
-    //  - Force 30 fps.
-    //  - Scale so that height becomes 960 (width preserved with aspect ratio).
-    //  - Crop the center horizontally to exactly 1080 width (discarding extra on the sides if needed).
-    //  - Set SAR to 1.
-    //
-    // For the background video, the previous pipeline is used.
+    //   - fps=30 ensures a consistent frame rate.
+    //   - scale=1080:960:force_original_aspect_ratio=increase zooms in so that the height fills 960 pixels.
+    //   - crop=1080:960 crops the center to exactly 1080×960, discarding extra width.
+    // For the background video, we do similar processing.
+    // Finally, both streams are stacked vertically.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
-[0:v]fps=30,scale=-1:960,crop=1080:960:(in_w-1080)/2:0,setsar=1[v0]; \
+[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; \
 [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
 [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
@@ -137,7 +136,7 @@ app.post('/combine-two', async (req, res) => {
 
 /**
  * Endpoint: /extract-audio
- * - (Unchanged from previous version)
+ * - (Remains as in the previous working version.)
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
