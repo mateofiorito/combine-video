@@ -30,10 +30,11 @@ app.get('/', (req, res) => {
 /**
  * Endpoint: /combine-two
  * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - For the main video, we zoom in (using scale=1080:960:force_original_aspect_ratio=increase) so that its height fills 960 pixels,
- *   then center-crop to exactly 1080 width. This avoids black spaces at the top and bottom.
- * - The background video is processed to fill 1080×960 via scaling and centered cropping.
- * - Finally, the two processed videos are stacked vertically (resulting in 1080×1920 output) with audio from the main video.
+ * - For the main video, we force a zoom by scaling using:
+ *       scale=iw*max(1080/iw\,960/ih):ih*max(1080/iw\,960/ih)
+ *   which ensures that both dimensions exceed the target. Then we center-crop to 1080x960.
+ * - The background video is processed similarly (center-cropped) so that both halves are exactly 1080x960.
+ * - Finally, the two videos are stacked vertically to produce a 1080x1920 output, with the audio taken from the main video.
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -79,15 +80,14 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Process and combine the videos using FFmpeg.
-    // For the main video:
-    //   - fps=30 ensures a consistent frame rate.
-    //   - scale=1080:960:force_original_aspect_ratio=increase zooms in so that the height fills 960 pixels.
-    //   - crop=1080:960 crops the center to exactly 1080×960, discarding extra width.
-    // For the background video, we do similar processing.
-    // Finally, both streams are stacked vertically.
+    // Combine the two videos using FFmpeg.
+    // Main video processing:
+    //  - fps=30 for a consistent frame rate.
+    //  - scale=iw*max(1080/iw\,960/ih):ih*max(1080/iw\,960/ih) zooms in so that both dimensions are at least as large as target.
+    //  - crop=1080:960:(in_w-1080)/2:(in_h-960)/2 crops the center to exactly 1080x960.
+    // Background processing remains similar.
     const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
-[0:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960,setsar=1[v0]; \
+[0:v]fps=30,scale=iw*max(1080/iw\\,960/ih):ih*max(1080/iw\\,960/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
 [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
 [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
@@ -101,7 +101,7 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Send the resulting file and clean up temporary files
+    // Send the resulting file and clean up temporary files.
     res.sendFile(outputPath, async (err) => {
       if (err) {
         console.error("Error sending file:", err);
