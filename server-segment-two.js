@@ -59,7 +59,7 @@ app.post('/combine-two', async (req, res) => {
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
   const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
   const publicPath = path.join(__dirname, 'videos', `combined-${timestamp}.mp4`);
-  const publicUrl = `https://yourdomain.com/videos/combined-${timestamp}.mp4`;
+  const publicUrl = `https://combine-video-production.up.railway.app/videos/combined-${timestamp}.mp4`;
 
   try {
     // Download main segment (video + audio)
