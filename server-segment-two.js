@@ -36,12 +36,13 @@ app.get('/', (req, res) => {
  * - Downloads two video segments:
  *    1. Main video segment (from startSeconds to endSeconds) with audio.
  *    2. Background segment (from 0 to (endSeconds - startSeconds)) as video only.
- * - Re-encodes both segments to lower quality if desired.
- * - For the main video, we apply extra zoom by scaling with:
- *      scale=iw*max(1080/iw,(960*1.2)/ih):ih*max(1080/iw,(960*1.2)/ih)
- *   then center-crop to 1080×960.
- * - The background video is processed with a standard center-crop.
- * - Both files are copied to a public folder and their URLs are returned.
+ * - Re-encodes each segment separately:
+ *    - For the main video, we zoom in by scaling with a factor of 1.2 on the height:
+ *          scale=iw*max(1080/iw,(960*1.2)/ih):ih*max(1080/iw,(960*1.2)/ih)
+ *      then center-crop to exactly 1080×960.
+ *    - For the background video, we scale to 1080x960 (using force_original_aspect_ratio=increase) and then center-crop.
+ * - The re-encoded files are copied to a public folder.
+ * - Returns a JSON object with separate URLs for the main video and the background video.
  */
 app.post('/get-video-urls', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -61,15 +62,15 @@ app.post('/get-video-urls', async (req, res) => {
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
   
-  // Output path for the combined video (if you were combining, but now we want separate files)
-  // Here, we want to create a combined video if Andynocode needs one;
-  // but based on your latest instruction, you'll send separate URLs.
-  // For demonstration, we combine them as before.
-  const outputPath = path.join(downloadsDir, `combined-${timestamp}.mp4`);
+  // Re-encoded output file paths
+  const mainReencodedPath = path.join(downloadsDir, `main-reencoded-${timestamp}.mp4`);
+  const backgroundReencodedPath = path.join(downloadsDir, `background-reencoded-${timestamp}.mp4`);
   
   // Public folder paths and URLs using your Railway domain.
-  const publicPath = path.join(__dirname, 'videos', `combined-${timestamp}.mp4`);
-  const publicUrl = `https://combine-video-production.up.railway.app/videos/combined-${timestamp}.mp4`;
+  const publicMainPath = path.join(__dirname, 'videos', `main-${timestamp}.mp4`);
+  const publicBackgroundPath = path.join(__dirname, 'videos', `background-${timestamp}.mp4`);
+  const publicMainUrl = `https://combine-video-production.up.railway.app/videos/main-${timestamp}.mp4`;
+  const publicBackgroundUrl = `https://combine-video-production.up.railway.app/videos/background-${timestamp}.mp4`;
   
   try {
     // Download the main video segment (with audio) trimmed from startSeconds to endSeconds.
@@ -98,42 +99,49 @@ app.post('/get-video-urls', async (req, res) => {
       });
     });
 
-    // Combine the two videos using FFmpeg.
-    // Main video: Zoom with extra factor (1.2) using scaling expression, then center-crop to 1080x960.
-    // Background video: Process with a centered crop.
-    // Then stack both videos vertically.
-    // Re-encode using H.264 baseline, faststart, and explicit pixel format.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
-[0:v]fps=30,scale=iw*max(1080/iw\\,(960*1.2)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v0]; \
-[1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
-[v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
-    console.log("Combining videos with FFmpeg:", ffmpegCmd);
+    // Re-encode the main segment to lower quality and apply extra zoom.
+    const ffmpegMainCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter_complex "fps=30,scale=iw*max(1080/iw\\,(960*1.2)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${mainReencodedPath}"`;
+    console.log("Re-encoding main video:", ffmpegMainCmd);
     await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, (error, stdout, stderr) => {
+      exec(ffmpegMainCmd, (error, stdout, stderr) => {
         if (error) {
-          console.error("FFmpeg error:", stderr);
-          return reject(new Error("FFmpeg failed to combine videos."));
+          console.error("FFmpeg re-encoding error (main):", stderr);
+          return reject(new Error("FFmpeg failed to re-encode main video."));
         }
         resolve();
       });
     });
 
-    // Copy the combined file to the public folder.
-    await fs.copyFile(outputPath, publicPath);
-    console.log("Copied combined video to public folder:", publicPath);
+    // Re-encode the background segment to lower quality.
+    const ffmpegBgCmd = `ffmpeg -y -i "${backgroundSegmentPath}" -filter_complex "fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -an "${backgroundReencodedPath}"`;
+    console.log("Re-encoding background video:", ffmpegBgCmd);
+    await new Promise((resolve, reject) => {
+      exec(ffmpegBgCmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error("FFmpeg re-encoding error (background):", stderr);
+          return reject(new Error("FFmpeg failed to re-encode background video."));
+        }
+        resolve();
+      });
+    });
+
+    // Copy the re-encoded files to the public folder.
+    await fs.copyFile(mainReencodedPath, publicMainPath);
+    await fs.copyFile(backgroundReencodedPath, publicBackgroundPath);
+    console.log("Copied re-encoded files to public folder.");
 
     // Clean up temporary files.
     await Promise.all([
       fs.unlink(mainSegmentPath),
       fs.unlink(backgroundSegmentPath),
-      fs.unlink(outputPath)
+      fs.unlink(mainReencodedPath),
+      fs.unlink(backgroundReencodedPath)
     ]);
 
-    // Return the public URL. (If you want separate URLs for main and background, modify accordingly.)
+    // Return the public URLs for main and background videos.
     res.json({
-      clip_url: publicUrl,
-      gameplay_url: publicUrl,
-      background_url: publicUrl
+      main_video_url: publicMainUrl,
+      background_video_url: publicBackgroundUrl
     });
   } catch (error) {
     console.error("Processing error:", error);
@@ -142,7 +150,8 @@ app.post('/get-video-urls', async (req, res) => {
       await Promise.all([
         fs.unlink(mainSegmentPath).catch(() => {}),
         fs.unlink(backgroundSegmentPath).catch(() => {}),
-        fs.unlink(outputPath).catch(() => {})
+        fs.unlink(mainReencodedPath).catch(() => {}),
+        fs.unlink(backgroundReencodedPath).catch(() => {})
       ]);
     } catch (cleanupError) {
       console.error("Cleanup error after failure:", cleanupError);
@@ -230,5 +239,4 @@ app.post('/extract-audio', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
 
