@@ -30,10 +30,10 @@ app.get('/', (req, res) => {
 /**
  * Endpoint: /combine-two
  * - Downloads the main video segment (from startSeconds to endSeconds) and a background segment (from 0 until the duration of the main video).
- * - For the main video, it first detects the optimal crop parameters to remove any letterbox (dark spaces) using FFmpeg’s cropdetect.
- * - Then it scales and crops the main video to exactly fill 1080x960.
- * - The background video is processed with the previous scaling/cropping method.
- * - Finally, the two processed videos are stacked vertically (resulting in 1080x1920), with the audio taken from the main video.
+ * - For the main video, it scales preserving the original width (by setting the height to 960) then center-crops horizontally to 1080.
+ *   This avoids stretching the image horizontally (some left/right parts may be lost).
+ * - The background video is processed as before.
+ * - Finally, the two processed videos are stacked vertically (producing a 1080x1920 output) with audio from the main video.
  */
 app.post('/combine-two', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
@@ -66,28 +66,6 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Run cropdetect on the main segment to detect black bars.
-    const cropdetectCmd = `ffmpeg -y -i "${mainSegmentPath}" -vf cropdetect=24:16:0 -t 5 -f null -`;
-    console.log("Detecting crop parameters:", cropdetectCmd);
-    let cropParams = "";
-    await new Promise((resolve, reject) => {
-      exec(cropdetectCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("Error during cropdetect:", error);
-          return reject(new Error("Failed to run cropdetect."));
-        }
-        // Look for a line containing crop=... in the stderr.
-        const match = stderr.match(/crop=\d+:\d+:\d+:\d+/);
-        if (match) {
-          cropParams = match[0];
-          console.log("Detected crop parameters:", cropParams);
-          resolve();
-        } else {
-          reject(new Error("Failed to detect crop parameters."));
-        }
-      });
-    });
-
     // Download the background segment (video only) from second 0 until the duration of the main video.
     const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
     console.log("Downloading background segment:", bgCmd);
@@ -101,11 +79,18 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
-    // Combine the two videos using FFmpeg.
-    // For the main video, we use the detected crop parameters to remove black bars,
-    // then scale to 1080x960.
-    // For the background video, we use the previous method (scale+crop centered).
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "[0:v]fps=30,${cropParams},scale=1080:960,setsar=1[v0]; [1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; [v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
+    // Process both videos with FFmpeg.
+    // For the main video:
+    //  - Force 30 fps.
+    //  - Scale so that height becomes 960 (width preserved with aspect ratio).
+    //  - Crop the center horizontally to exactly 1080 width (discarding extra on the sides if needed).
+    //  - Set SAR to 1.
+    //
+    // For the background video, the previous pipeline is used.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -i "${backgroundSegmentPath}" -filter_complex "\
+[0:v]fps=30,scale=-1:960,crop=1080:960:(in_w-1080)/2:0,setsar=1[v0]; \
+[1:v]fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1[v1]; \
+[v0][v1]vstack=inputs=2,format=yuv420p[v]" -map "[v]" -map 0:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outputPath}"`;
     console.log("Combining videos with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
@@ -117,6 +102,7 @@ app.post('/combine-two', async (req, res) => {
       });
     });
 
+    // Send the resulting file and clean up temporary files
     res.sendFile(outputPath, async (err) => {
       if (err) {
         console.error("Error sending file:", err);
@@ -133,6 +119,7 @@ app.post('/combine-two', async (req, res) => {
         console.error("Cleanup error:", cleanupError);
       }
     });
+
   } catch (error) {
     console.error("Processing error:", error);
     res.status(500).json({ error: error.message });
@@ -150,8 +137,7 @@ app.post('/combine-two', async (req, res) => {
 
 /**
  * Endpoint: /extract-audio
- * - Downloads the entire audio from the main video (using bestaudio).
- * - Uses FFmpeg input seeking to extract exactly the segment from startSeconds to endSeconds.
+ * - (Unchanged from previous version)
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -184,9 +170,6 @@ app.post('/extract-audio', async (req, res) => {
     });
 
     // Use FFmpeg input seeking to extract exactly the desired segment.
-    // -ss before the input seeks accurately.
-    // -t specifies the duration.
-    // -avoid_negative_ts make_zero resets any negative timestamps.
     const ffmpegCmd = `ffmpeg -y -ss ${start} -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
     console.log("Extracting audio with FFmpeg using input seeking:", ffmpegCmd);
     await new Promise((resolve, reject) => {
