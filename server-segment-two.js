@@ -133,8 +133,9 @@ app.post('/combine-two', async (req, res) => {
 
 /**
  * Endpoint: /extract-audio
- * - Downloads the main video segment from startSeconds to endSeconds using yt-dlp (audio-only).
+ * - Downloads the main video segment (from startSeconds to endSeconds) as an audio-only file.
  * - Uses FFmpeg to extract and convert the audio to an MP3 file.
+ * - Applies an explicit trim using the atrim filter so that the audio duration exactly matches the desired segment.
  */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
@@ -147,6 +148,8 @@ app.post('/extract-audio', async (req, res) => {
     });
   }
 
+  // Calculate the duration for the audio segment.
+  const duration = end - start;
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
@@ -166,10 +169,10 @@ app.post('/extract-audio', async (req, res) => {
       });
     });
 
-    // Extract audio and convert to MP3 using FFmpeg.
-    // The '-vn' flag disables video, and libmp3lame is used for MP3 encoding.
-    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
-    console.log("Extracting audio with FFmpeg:", ffmpegCmd);
+    // Extract audio and trim it to the exact duration using FFmpeg.
+    // The atrim filter is used to ensure the output duration is exactly 'duration' seconds.
+    const ffmpegCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter:a "atrim=start=0:duration=${duration},asetpts=PTS-STARTPTS" -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
+    console.log("Extracting and trimming audio with FFmpeg:", ffmpegCmd);
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, (error, stdout, stderr) => {
         if (error) {
@@ -213,4 +216,3 @@ app.post('/extract-audio', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
