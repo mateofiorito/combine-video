@@ -1,9 +1,12 @@
 const express = require('express');
-const { exec } = require('child_process');
+const { promisify } = require('util');
+const { exec: execCb } = require('child_process');
 const path = require('path');
 const cors = require('cors');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 
+const exec = promisify(execCb);
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -13,10 +16,8 @@ app.use(cors());
 // Serve the 'videos' folder as static content.
 app.use('/videos', express.static(path.join(__dirname, 'videos')));
 
-const downloadsDir = path.join(__dirname, 'downloads');
-const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your cookies file path
-
 // Ensure the downloads and videos directories exist.
+const downloadsDir = path.join(__dirname, 'downloads');
 (async () => {
   try {
     await fs.mkdir(downloadsDir, { recursive: true });
@@ -27,110 +28,105 @@ const cookiesPath = path.join(__dirname, 'youtube-cookies.txt'); // Set your coo
   }
 })();
 
+// Directory where your cookie files live
+const cookiesDir = path.join(__dirname, 'youtube-cookies');
+
+// Helper: get all cookie files
+function getCookieFiles() {
+  return fsSync.readdirSync(cookiesDir)
+    .filter(f => /^youtube-cookies-\d+\.txt$/.test(f))
+    .map(f => path.join(cookiesDir, f));
+}
+
+// Helper: detect cookie-related errors
+function isCookieError(err, stderr = '') {
+  const msg = (err.message + (stderr || '')).toLowerCase();
+  return msg.includes('unable to load cookies')
+      || msg.includes('cookie')
+      || msg.includes('certificate')
+      || msg.includes('403')
+      || msg.includes('forbidden');
+}
+
+// Try running a yt-dlp command with each cookie file in turn.
+// On cookie error, delete the bad cookie and retry with the next.
+async function runWithRotatingCookies(commandBuilder) {
+  let cookieFiles = getCookieFiles();
+  for (const cookiePath of cookieFiles) {
+    const cmd = commandBuilder(cookiePath);
+    try {
+      await exec(cmd);
+      return; // success
+    } catch (err) {
+      if (isCookieError(err, err.stderr)) {
+        try {
+          fsSync.unlinkSync(cookiePath);
+          console.warn(`Deleted bad cookie file: ${cookiePath}`);
+        } catch (unlinkErr) {
+          console.error(`Failed to delete cookie file ${cookiePath}:`, unlinkErr);
+        }
+        continue; // try next cookie
+      }
+      throw err; // non-cookie error
+    }
+  }
+  throw new Error('No valid cookie files remaining');
+}
+
 app.get('/', (req, res) => {
   res.send('API for getting video URLs is running!');
 });
 
-/**
- * Endpoint: /get-video-urls
- * - Downloads two video segments:
- *    1. Main video segment (from startSeconds to endSeconds) with audio.
- *    2. Background segment (from 0 to (endSeconds - startSeconds)) as video only.
- * - Re-encodes each segment separately:
- *    - For the main video, we zoom in by scaling with a factor of 1.2 on the height:
- *          scale=iw*max(1080/iw,(960*1.2)/ih):ih*max(1080/iw,(960*1.2)/ih)
- *      then center-crop to exactly 1080×960.
- *    - For the background video, we scale to 1080x960 (using force_original_aspect_ratio=increase) and then center-crop.
- * - The re-encoded files are copied to a public folder.
- * - Returns a JSON object with separate URLs for the main video and the background video.
- */
 app.post('/get-video-urls', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
-  
   if (!mainUrl || !backgroundUrl || isNaN(start) || isNaN(end) || start >= end) {
-    return res.status(400).json({
-      error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.'
-    });
+    return res.status(400).json({ error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.' });
   }
-  
+
   const duration = end - start;
   const timestamp = Date.now();
 
-  // Temporary download file paths
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
-  
-  // Re-encoded output file paths
   const mainReencodedPath = path.join(downloadsDir, `main-reencoded-${timestamp}.mp4`);
   const backgroundReencodedPath = path.join(downloadsDir, `background-reencoded-${timestamp}.mp4`);
-  
-  // Public folder paths and URLs using your Railway domain.
+
   const publicMainPath = path.join(__dirname, 'videos', `main-${timestamp}.mp4`);
   const publicBackgroundPath = path.join(__dirname, 'videos', `background-${timestamp}.mp4`);
   const publicMainUrl = `https://combine-video-production.up.railway.app/videos/main-${timestamp}.mp4`;
   const publicBackgroundUrl = `https://combine-video-production.up.railway.app/videos/background-${timestamp}.mp4`;
-  
+
   try {
-    // Download the main video segment (with audio) trimmed from startSeconds to endSeconds.
-    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`;
-    console.log("Downloading main segment:", mainCmd);
-    await new Promise((resolve, reject) => {
-      exec(mainCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("Error downloading main segment:", stderr);
-          return reject(new Error("Failed to download main segment."));
-        }
-        resolve();
-      });
-    });
+    // Download main segment with rotating cookies
+    console.log('Downloading main segment');
+    await runWithRotatingCookies(cookiePath =>
+      `yt-dlp --no-check-certificate --cookies "${cookiePath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`
+    );
 
-    // Download the background segment (video only) from 0 to the duration.
-    const bgCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`;
-    console.log("Downloading background segment:", bgCmd);
-    await new Promise((resolve, reject) => {
-      exec(bgCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("Error downloading background segment:", stderr);
-          return reject(new Error("Failed to download background segment."));
-        }
-        resolve();
-      });
-    });
+    // Download background segment with rotating cookies
+    console.log('Downloading background segment');
+    await runWithRotatingCookies(cookiePath =>
+      `yt-dlp --no-check-certificate --cookies "${cookiePath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`
+    );
 
-    // Re-encode the main segment to lower quality and apply extra zoom.
+    // Re-encode main segment
     const ffmpegMainCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter_complex "fps=30,scale=iw*max(1080/iw\\,(960*1.2)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${mainReencodedPath}"`;
-    console.log("Re-encoding main video:", ffmpegMainCmd);
-    await new Promise((resolve, reject) => {
-      exec(ffmpegMainCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("FFmpeg re-encoding error (main):", stderr);
-          return reject(new Error("FFmpeg failed to re-encode main video."));
-        }
-        resolve();
-      });
-    });
+    console.log('Re-encoding main video');
+    await exec(ffmpegMainCmd);
 
-    // Re-encode the background segment to lower quality.
+    // Re-encode background segment
     const ffmpegBgCmd = `ffmpeg -y -i "${backgroundSegmentPath}" -filter_complex "fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -an "${backgroundReencodedPath}"`;
-    console.log("Re-encoding background video:", ffmpegBgCmd);
-    await new Promise((resolve, reject) => {
-      exec(ffmpegBgCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("FFmpeg re-encoding error (background):", stderr);
-          return reject(new Error("FFmpeg failed to re-encode background video."));
-        }
-        resolve();
-      });
-    });
+    console.log('Re-encoding background video');
+    await exec(ffmpegBgCmd);
 
-    // Copy the re-encoded files to the public folder.
+    // Copy to public folder
     await fs.copyFile(mainReencodedPath, publicMainPath);
     await fs.copyFile(backgroundReencodedPath, publicBackgroundPath);
-    console.log("Copied re-encoded files to public folder.");
+    console.log('Copied re-encoded files to public folder.');
 
-    // Clean up temporary files.
+    // Clean up
     await Promise.all([
       fs.unlink(mainSegmentPath),
       fs.unlink(backgroundSegmentPath),
@@ -138,105 +134,67 @@ app.post('/get-video-urls', async (req, res) => {
       fs.unlink(backgroundReencodedPath)
     ]);
 
-    // Return the public URLs for main and background videos.
-    res.json({
-      main_video_url: publicMainUrl,
-      background_video_url: publicBackgroundUrl
-    });
+    res.json({ main_video_url: publicMainUrl, background_video_url: publicBackgroundUrl });
   } catch (error) {
-    console.error("Processing error:", error);
+    console.error('Processing error:', error);
     res.status(500).json({ error: error.message });
-    try {
-      await Promise.all([
-        fs.unlink(mainSegmentPath).catch(() => {}),
-        fs.unlink(backgroundSegmentPath).catch(() => {}),
-        fs.unlink(mainReencodedPath).catch(() => {}),
-        fs.unlink(backgroundReencodedPath).catch(() => {})
-      ]);
-    } catch (cleanupError) {
-      console.error("Cleanup error after failure:", cleanupError);
-    }
+    // Cleanup on failure
+    await Promise.all([
+      fs.unlink(mainSegmentPath).catch(() => {}),
+      fs.unlink(backgroundSegmentPath).catch(() => {}),
+      fs.unlink(mainReencodedPath).catch(() => {}),
+      fs.unlink(backgroundReencodedPath).catch(() => {})
+    ]);
   }
 });
 
-/**
- * Endpoint: /extract-audio
- * - Downloads the entire audio stream from the main video using yt-dlp.
- * - Uses FFmpeg to extract the segment from startSeconds to endSeconds.
- */
 app.post('/extract-audio', async (req, res) => {
   const { mainUrl, startSeconds, endSeconds } = req.body;
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
-  
   if (!mainUrl || isNaN(start) || isNaN(end) || start >= end) {
-    return res.status(400).json({
-      error: 'Invalid or missing fields: mainUrl, startSeconds, endSeconds.'
-    });
+    return res.status(400).json({ error: 'Invalid or missing fields: mainUrl, startSeconds, endSeconds.' });
   }
-  
+
   const duration = end - start;
   const timestamp = Date.now();
   const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
   const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
-  
+
   try {
-    // Download the entire audio stream using bestaudio.
-    const mainCmd = `yt-dlp --no-check-certificate --cookies "${cookiesPath}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`;
-    console.log("Downloading audio stream:", mainCmd);
-    await new Promise((resolve, reject) => {
-      exec(mainCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("Error downloading audio stream:", stderr);
-          return reject(new Error("Failed to download audio stream."));
-        }
-        resolve();
-      });
-    });
-    
-    // Use FFmpeg input seeking to extract exactly the desired audio segment.
+    // Download audio stream with rotating cookies
+    console.log('Downloading audio stream');
+    await runWithRotatingCookies(cookiePath =>
+      `yt-dlp --no-check-certificate --cookies "${cookiePath}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`
+    );
+
+    // Extract audio segment
     const ffmpegCmd = `ffmpeg -y -ss ${start} -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
-    console.log("Extracting audio with FFmpeg using input seeking:", ffmpegCmd);
-    await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error("FFmpeg audio extraction error:", stderr);
-          return reject(new Error("FFmpeg failed to extract audio."));
-        }
-        resolve();
-      });
-    });
-    
+    console.log('Extracting audio with FFmpeg');
+    await exec(ffmpegCmd);
+
     res.sendFile(audioOutputPath, async (err) => {
       if (err) {
-        console.error("Error sending file:", err);
-        return res.status(500).json({ error: "Failed to send audio file." });
+        console.error('Error sending file:', err);
+        return res.status(500).json({ error: 'Failed to send audio file.' });
       }
-      try {
-        await Promise.all([
-          fs.unlink(mainSegmentPath),
-          fs.unlink(audioOutputPath)
-        ]);
-        console.log("Cleaned up temporary audio files.");
-      } catch (cleanupError) {
-        console.error("Cleanup error:", cleanupError);
-      }
+      // Cleanup
+      await Promise.all([
+        fs.unlink(mainSegmentPath),
+        fs.unlink(audioOutputPath)
+      ]);
+      console.log('Cleaned up temporary audio files.');
     });
   } catch (error) {
-    console.error("Processing audio error:", error);
+    console.error('Processing audio error:', error);
     res.status(500).json({ error: error.message });
-    try {
-      await Promise.all([
-        fs.unlink(mainSegmentPath).catch(() => {}),
-        fs.unlink(audioOutputPath).catch(() => {})
-      ]);
-    } catch (cleanupError) {
-      console.error("Cleanup error after failure:", cleanupError);
-    }
+    await Promise.all([
+      fs.unlink(mainSegmentPath).catch(() => {}),
+      fs.unlink(audioOutputPath).catch(() => {})
+    ]);
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
