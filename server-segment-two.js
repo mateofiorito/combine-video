@@ -1,3 +1,6 @@
+// At the very top, disable strict TLS checks if needed
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const express = require('express');
 const { promisify } = require('util');
 const { exec: execCb } = require('child_process');
@@ -5,18 +8,25 @@ const path = require('path');
 const cors = require('cors');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-
 const exec = promisify(execCb);
+
+// Fallback download libraries
+const ytdl = require('@distube/ytdl-core');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const axios = require('axios');
+const puppeteer = require('puppeteer');
+ffmpeg.setFfmpegPath(ffmpegPath);
+
 const app = express();
 const PORT = process.env.PORT || 8080;
-
 app.use(express.json());
 app.use(cors());
 
-// Serve the 'videos' folder as static content.
+// Serve static videos
 app.use('/videos', express.static(path.join(__dirname, 'videos')));
 
-// Ensure the downloads and videos directories exist.
+// Ensure directories exist
 const downloadsDir = path.join(__dirname, 'downloads');
 (async () => {
   try {
@@ -28,35 +38,28 @@ const downloadsDir = path.join(__dirname, 'downloads');
   }
 })();
 
-// Directory where your cookie files live
+// -- COOKIE ROTATION HELPERS --
 const cookiesDir = path.join(__dirname, 'youtube-cookies');
-
-// Helper: get all cookie files
 function getCookieFiles() {
   return fsSync.readdirSync(cookiesDir)
     .filter(f => /^youtube-cookies-\d+\.txt$/.test(f))
     .map(f => path.join(cookiesDir, f));
 }
-
-// Helper: detect cookie-related errors
 function isCookieError(err, stderr = '') {
-  const msg = (err.message + (stderr || '')).toLowerCase();
+  const msg = (err.message + stderr).toLowerCase();
   return msg.includes('unable to load cookies')
       || msg.includes('cookie')
       || msg.includes('certificate')
       || msg.includes('403')
       || msg.includes('forbidden');
 }
-
-// Try running a yt-dlp command with each cookie file in turn.
-// On cookie error, delete the bad cookie and retry with the next.
 async function runWithRotatingCookies(commandBuilder) {
   let cookieFiles = getCookieFiles();
   for (const cookiePath of cookieFiles) {
     const cmd = commandBuilder(cookiePath);
     try {
       await exec(cmd);
-      return; // success
+      return;
     } catch (err) {
       if (isCookieError(err, err.stderr)) {
         try {
@@ -65,86 +68,173 @@ async function runWithRotatingCookies(commandBuilder) {
         } catch (unlinkErr) {
           console.error(`Failed to delete cookie file ${cookiePath}:`, unlinkErr);
         }
-        continue; // try next cookie
+        continue;
       }
-      throw err; // non-cookie error
+      throw err;
     }
   }
   throw new Error('No valid cookie files remaining');
 }
 
-app.get('/', (req, res) => {
-  res.send('API for getting video URLs is running!');
-});
+// -- UTILITY FUNCTIONS --
+function extractVideoId(url) {
+  const patterns = [
+    /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/,
+    /^([a-zA-Z0-9_-]{11})$/
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match && match[1]) return match[1];
+  }
+  return null;
+}
+
+async function retryOperation(fn, maxRetries = 3, baseDelay = 2000) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const delay = baseDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
+      console.warn(`Attempt ${attempt} failed: ${err.message}. Retrying in ${Math.round(delay)} ms`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// -- DOWNLOAD ENGINES --
+async function downloadWithYtdl(url, outputPath, opts = {}) {
+  const stream = ytdl(url, opts);
+  return new Promise((resolve, reject) => {
+    const ws = fsSync.createWriteStream(outputPath);
+    stream.pipe(ws);
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+    stream.on('error', reject);
+  });
+}
+
+async function downloadWithPuppeteer(videoId, outputPath) {
+  const browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+  try {
+    const page = await browser.newPage();
+    await page.goto(`https://www.youtube.com/watch?v=${videoId}`, { waitUntil: 'networkidle2' });
+    const src = await page.$eval('video', v => v.src);
+    const resp = await axios.get(src, { responseType: 'stream', timeout: 60000 });
+    return new Promise((res, rej) => {
+      const ws = fsSync.createWriteStream(outputPath);
+      resp.data.pipe(ws);
+      ws.on('finish', res);
+      ws.on('error', rej);
+    });
+  } finally {
+    await browser.close();
+  }
+}
+
+async function downloadWithAxiosScrape(videoId, outputPath) {
+  const pageResp = await axios.get(`https://www.youtube.com/watch?v=${videoId}`);
+  const match = pageResp.data.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/);
+  if (!match) throw new Error('Could not parse playerResponse');
+  const player = JSON.parse(match[1]);
+  const urlObj = player.streamingData.formats[0].url;
+  const resp = await axios.get(urlObj, { responseType: 'stream' });
+  return new Promise((res, rej) => {
+    const ws = fsSync.createWriteStream(outputPath);
+    resp.data.pipe(ws);
+    ws.on('finish', res);
+    ws.on('error', rej);
+  });
+}
+
+async function downloadWithYtDlp(url, outputPath) {
+  return runWithRotatingCookies(cookiePath =>
+    `yt-dlp --no-check-certificate --cookies "${cookiePath}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${outputPath}" "${url}"`
+  );
+}
+
+// -- UNIFIED DOWNLOAD SEGMENT --
+async function downloadSegment(url, outputPath, opts = {}) {
+  const videoId = extractVideoId(url);
+  // 1) ytdl-core
+  try {
+    console.log('Downloading with ytdl-core');
+    return await retryOperation(() => downloadWithYtdl(url, outputPath, opts));
+  } catch (err) {
+    console.warn('ytdl-core failed:', err.message);
+  }
+  // 2) Puppeteer
+  if (videoId) {
+    try {
+      console.log('Downloading with Puppeteer');
+      return await retryOperation(() => downloadWithPuppeteer(videoId, outputPath));
+    } catch (err) {
+      console.warn('Puppeteer fallback failed:', err.message);
+    }
+  }
+  // 3) Axios scrape
+  if (videoId) {
+    try {
+      console.log('Downloading with Axios scrape');
+      return await retryOperation(() => downloadWithAxiosScrape(videoId, outputPath));
+    } catch (err) {
+      console.warn('Axios scrape fallback failed:', err.message);
+    }
+  }
+  // 4) yt-dlp + rotating cookies
+  console.log('Downloading with yt-dlp fallback');
+  return downloadWithYtDlp(url, outputPath);
+}
+
+// -- ROUTES --
+app.get('/', (req, res) => res.send('API for getting video URLs is running!'));
 
 app.post('/get-video-urls', async (req, res) => {
   const { mainUrl, backgroundUrl, startSeconds, endSeconds } = req.body;
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
   if (!mainUrl || !backgroundUrl || isNaN(start) || isNaN(end) || start >= end) {
-    return res.status(400).json({ error: 'Invalid or missing fields: mainUrl, backgroundUrl, startSeconds, endSeconds.' });
+    return res.status(400).json({ error: 'Invalid fields.' });
   }
-
   const duration = end - start;
-  const timestamp = Date.now();
+  const ts = Date.now();
 
-  const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
-  const backgroundSegmentPath = path.join(downloadsDir, `background-${timestamp}.mp4`);
-  const mainReencodedPath = path.join(downloadsDir, `main-reencoded-${timestamp}.mp4`);
-  const backgroundReencodedPath = path.join(downloadsDir, `background-reencoded-${timestamp}.mp4`);
-
-  const publicMainPath = path.join(__dirname, 'videos', `main-${timestamp}.mp4`);
-  const publicBackgroundPath = path.join(__dirname, 'videos', `background-${timestamp}.mp4`);
-  const publicMainUrl = `https://combine-video-production.up.railway.app/videos/main-${timestamp}.mp4`;
-  const publicBackgroundUrl = `https://combine-video-production.up.railway.app/videos/background-${timestamp}.mp4`;
+  const mainSegment = path.join(downloadsDir, `main-${ts}.mp4`);
+  const bgSegment   = path.join(downloadsDir, `background-${ts}.mp4`);
+  const mainRe      = path.join(downloadsDir, `main-reencoded-${ts}.mp4`);
+  const bgRe        = path.join(downloadsDir, `background-reencoded-${ts}.mp4`);
+  const publicDir   = path.join(__dirname, 'videos');
 
   try {
-    // Download main segment with rotating cookies
-    console.log('Downloading main segment');
-    await runWithRotatingCookies(cookiePath =>
-      `yt-dlp --no-check-certificate --cookies "${cookiePath}" --download-sections "*${start}-${end}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o "${mainSegmentPath}" "${mainUrl}"`
-    );
+    console.log('→ Download main segment');
+    await downloadSegment(mainUrl, mainSegment, { downloadSections: `*${start}-${end}` });
 
-    // Download background segment with rotating cookies
-    console.log('Downloading background segment');
-    await runWithRotatingCookies(cookiePath =>
-      `yt-dlp --no-check-certificate --cookies "${cookiePath}" --download-sections "*0-${duration}" -f "bestvideo[ext=mp4]" -o "${backgroundSegmentPath}" "${backgroundUrl}"`
-    );
+    console.log('→ Download background segment');
+    await downloadSegment(backgroundUrl, bgSegment, { downloadSections: `*0-${duration}`, format: 'bestvideo[ext=mp4]' });
 
-    // Re-encode main segment
-    const ffmpegMainCmd = `ffmpeg -y -i "${mainSegmentPath}" -filter_complex "fps=30,scale=iw*max(1080/iw\\,(960*1.2)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${mainReencodedPath}"`;
-    console.log('Re-encoding main video');
-    await exec(ffmpegMainCmd);
+    console.log('→ Re-encode main');
+    await exec(`ffmpeg -y -i "${mainSegment}" -filter_complex "fps=30,scale=iw*max(1080/iw\\,(960*1.2)/ih):ih*max(1080/iw\\,(960*1.2)/ih),crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -c:a aac -b:a 128k "${mainRe}"`);
 
-    // Re-encode background segment
-    const ffmpegBgCmd = `ffmpeg -y -i "${backgroundSegmentPath}" -filter_complex "fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -an "${backgroundReencodedPath}"`;
-    console.log('Re-encoding background video');
-    await exec(ffmpegBgCmd);
+    console.log('→ Re-encode background');
+    await exec(`ffmpeg -y -i "${bgSegment}" -filter_complex "fps=30,scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960:(in_w-1080)/2:(in_h-960)/2,setsar=1" -c:v libx264 -profile:v baseline -preset veryfast -crf 28 -movflags +faststart -pix_fmt yuv420p -an "${bgRe}"`);
 
-    // Copy to public folder
-    await fs.copyFile(mainReencodedPath, publicMainPath);
-    await fs.copyFile(backgroundReencodedPath, publicBackgroundPath);
-    console.log('Copied re-encoded files to public folder.');
+    // Copy to public
+    await fs.copyFile(mainRe, path.join(publicDir, `main-${ts}.mp4`));
+    await fs.copyFile(bgRe,   path.join(publicDir, `background-${ts}.mp4`));
 
-    // Clean up
-    await Promise.all([
-      fs.unlink(mainSegmentPath),
-      fs.unlink(backgroundSegmentPath),
-      fs.unlink(mainReencodedPath),
-      fs.unlink(backgroundReencodedPath)
-    ]);
+    // Cleanup
+    await Promise.all([fs.unlink(mainSegment), fs.unlink(bgSegment), fs.unlink(mainRe), fs.unlink(bgRe)]);
 
-    res.json({ main_video_url: publicMainUrl, background_video_url: publicBackgroundUrl });
-  } catch (error) {
-    console.error('Processing error:', error);
-    res.status(500).json({ error: error.message });
-    // Cleanup on failure
-    await Promise.all([
-      fs.unlink(mainSegmentPath).catch(() => {}),
-      fs.unlink(backgroundSegmentPath).catch(() => {}),
-      fs.unlink(mainReencodedPath).catch(() => {}),
-      fs.unlink(backgroundReencodedPath).catch(() => {})
-    ]);
+    res.json({
+      main_video_url: `/videos/main-${ts}.mp4`,
+      background_video_url: `/videos/background-${ts}.mp4`
+    });
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: err.message });
+    await Promise.all([fs.unlink(mainSegment).catch(() => {}), fs.unlink(bgSegment).catch(() => {}), fs.unlink(mainRe).catch(() => {}), fs.unlink(bgRe).catch(() => {})]);
   }
 });
 
@@ -153,48 +243,29 @@ app.post('/extract-audio', async (req, res) => {
   const start = parseFloat(startSeconds);
   const end = parseFloat(endSeconds);
   if (!mainUrl || isNaN(start) || isNaN(end) || start >= end) {
-    return res.status(400).json({ error: 'Invalid or missing fields: mainUrl, startSeconds, endSeconds.' });
+    return res.status(400).json({ error: 'Invalid fields.' });
   }
-
   const duration = end - start;
-  const timestamp = Date.now();
-  const mainSegmentPath = path.join(downloadsDir, `main-${timestamp}.mp4`);
-  const audioOutputPath = path.join(downloadsDir, `audio-${timestamp}.mp3`);
+  const ts = Date.now();
+  const segment = path.join(downloadsDir, `main-${ts}.mp4`);
+  const audio   = path.join(downloadsDir, `audio-${ts}.mp3`);
 
   try {
-    // Download audio stream with rotating cookies
-    console.log('Downloading audio stream');
-    await runWithRotatingCookies(cookiePath =>
-      `yt-dlp --no-check-certificate --cookies "${cookiePath}" -f bestaudio -o "${mainSegmentPath}" "${mainUrl}"`
-    );
+    console.log('→ Download audio segment');
+    await downloadSegment(mainUrl, segment, { format: 'bestaudio' });
 
-    // Extract audio segment
-    const ffmpegCmd = `ffmpeg -y -ss ${start} -t ${duration} -i "${mainSegmentPath}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audioOutputPath}"`;
-    console.log('Extracting audio with FFmpeg');
-    await exec(ffmpegCmd);
+    console.log('→ Extract audio');
+    await exec(`ffmpeg -y -ss ${start} -t ${duration} -i "${segment}" -avoid_negative_ts make_zero -vn -acodec libmp3lame -q:a 2 "${audio}"`);
 
-    res.sendFile(audioOutputPath, async (err) => {
-      if (err) {
-        console.error('Error sending file:', err);
-        return res.status(500).json({ error: 'Failed to send audio file.' });
-      }
-      // Cleanup
-      await Promise.all([
-        fs.unlink(mainSegmentPath),
-        fs.unlink(audioOutputPath)
-      ]);
-      console.log('Cleaned up temporary audio files.');
+    res.sendFile(audio, async err => {
+      if (err) return res.status(500).json({ error: 'Failed to send audio.' });
+      await Promise.all([fs.unlink(segment), fs.unlink(audio)]);
     });
-  } catch (error) {
-    console.error('Processing audio error:', error);
-    res.status(500).json({ error: error.message });
-    await Promise.all([
-      fs.unlink(mainSegmentPath).catch(() => {}),
-      fs.unlink(audioOutputPath).catch(() => {})
-    ]);
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: err.message });
+    await Promise.all([fs.unlink(segment).catch(() => {}), fs.unlink(audio).catch(() => {})]);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));

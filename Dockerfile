@@ -1,26 +1,25 @@
-# Use an official Node.js image as the base
-FROM node:18
+# Use official Node.js LTS base image
+FROM node:18-alpine AS build
 
-# Update package lists and install Python3, pip, and ffmpeg
-RUN apt-get update && apt-get install -y python3-pip ffmpeg
-
-# Install yt-dlp using pip3 with the flag to override system constraints
-RUN pip3 install --break-system-packages yt-dlp
-
-# Set the working directory inside the container
+# Set working directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json (if available)
-COPY package*.json ./
+# Install ffmpeg runtime dependencies
+RUN apk add --no-cache \
+    ffmpeg \
+    chromium
 
-# Install Node.js dependencies
-RUN npm install
+# Copy package manifests
+COPY package.json package-lock.json* ./
 
-# Copy the rest of your application code
+# Install only production dependencies
+RUN npm ci --only=production
+
+# Copy application
 COPY . .
 
-# Expose the port your app runs on
-EXPOSE 3000
+# Expose port
+EXPOSE 8080
 
-# Start the server using our new file
+# Set default command
 CMD ["node", "server-segment-two.js"]
