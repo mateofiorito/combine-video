@@ -2,9 +2,9 @@
   "name": "combine-video-api",
   "version": "1.0.0",
   "description": "Resilient YouTube segment downloader and re-encoder service",
-  "main": "app.js",
+  "main": "server-segment-two.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node server-segment-two.js"
   },
   "engines": {
     "node": ">=16"
