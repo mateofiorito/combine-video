@@ -1,5 +1,5 @@
 # Use official Node.js LTS base image
-FROM node:18-alpine AS build
+FROM node:18-bullseye-slim
 
 # Set working directory
 WORKDIR /app
