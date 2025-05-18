@@ -1,13 +1,15 @@
-# Use official Node.js LTS base image
-FROM node:18-bullseye-slim
+# Use official Node.js LTS base image (Debian slim)
+FROM node:18-slim AS build
 
 # Set working directory
 WORKDIR /app
 
-# Install ffmpeg runtime dependencies
-RUN apk add --no-cache \
-    ffmpeg \
-    chromium
+# Install ffmpeg & chromium via apt
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      chromium \
+ && rm -rf /var/lib/apt/lists/*
 
 # Copy package manifests
 COPY package.json package-lock.json* ./
@@ -15,11 +17,11 @@ COPY package.json package-lock.json* ./
 # Install only production dependencies
 RUN npm ci --only=production
 
-# Copy application
+# Copy application code
 COPY . .
 
-# Expose port
+# Expose application port
 EXPOSE 8080
 
-# Set default command
+# Start the server
 CMD ["node", "server-segment-two.js"]
